@@ -12,6 +12,7 @@ import torch.nn as nn
 
 from ultralytics.nn.autobackend import check_class_names
 from ultralytics.nn.modules import (
+    LightResBlock,
     AIFI,
     C1,
     C2,
@@ -1642,6 +1643,11 @@ def parse_model(d, ch, verbose=True):
                 with contextlib.suppress(ValueError):
                     args[j] = locals()[a] if a in locals() else ast.literal_eval(a)
         n = n_ = max(round(n * depth), 1) if n > 1 else n  # depth gain
+        # Special-case: LightResBlock expects the input channel count `c` as its single argument.
+        # Ensure the YAML-provided first arg (often an 'internal' channel count) is replaced
+        # with the actual incoming channels `ch[f]` so depthwise conv groups match the input.
+        if m is LightResBlock:
+            args = [ch[f], *args[1:]]
         if m in base_modules:
             c1, c2 = ch[f], args[0]
             if c2 != nc:  # if c2 != nc (e.g., Classify() output)

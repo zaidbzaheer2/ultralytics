@@ -59,6 +59,7 @@ from .block import (
     ResNetLayer,
     SCDown,
     TorchVision,
+    LightResBlock
 )
 from .conv import (
     CBAM,
@@ -107,6 +108,7 @@ from .transformer import (
 )
 
 __all__ = (
+    "LightResBlock",
     "AIFI",
     "C1",
     "C2",

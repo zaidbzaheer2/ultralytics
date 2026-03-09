@@ -52,9 +52,21 @@ __all__ = (
     "ResNetLayer",
     "SCDown",
     "TorchVision",
+    "LightResBlock"
 )
 
+class LightResBlock(nn.Module):
+    def __init__(self, c):
+        super().__init__()
+        self.dw = DWConv(c, c, k=3)
+        self.pw = Conv(c, c, k=1, act=False)
+        self.act = nn.SiLU()
 
+    def forward(self, x):
+        y = self.dw(x)
+        y = self.pw(y)
+        return self.act(x + y)
+    
 class DFL(nn.Module):
     """Integral module of Distribution Focal Loss (DFL).
 
