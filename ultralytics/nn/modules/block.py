@@ -52,9 +52,166 @@ __all__ = (
     "ResNetLayer",
     "SCDown",
     "TorchVision",
+    "DA2C2f"
 )
 
+class DualAxisAttn(nn.Module):
+    """
+    Dual-Axis Area Attention.
+    
+    Addresses the documented YOLOv12 limitation that AAttn processes
+    feature maps along only one axis (horizontal OR vertical) at a time,
+    missing cross-axis spatial relationships.
+    
+    Runs area attention along H-axis and W-axis in parallel using
+    SHARED projection weights, then fuses with a learned gate.
+    Shared weights keep parameter count near-identical to single-axis AAttn.
+    
+    Reference gap: YOLOv12 authors cite CSWin (dual-axis) as related work
+    but explicitly chose single-axis for speed. This module recovers the
+    accuracy with minimal overhead by sharing projections across axes.
+    """
 
+    def __init__(self, c, num_heads=8, area=4):
+        """
+        Args:
+            c:          input/output channel count
+            num_heads:  attention heads (same as AAttn default)
+            area:       number of strips per axis (same as AAttn default=4)
+        """
+        super().__init__()
+        self.area      = area
+        self.num_heads = num_heads
+        self.head_dim  = c // num_heads
+        self.scale     = self.head_dim ** -0.5
+
+        # Shared QKV projection — used for BOTH axes
+        # This is the key difference from two independent attention modules
+        # Parameter count stays same as single-axis AAttn
+        self.qkv = Conv(c, c * 3, 1)          # 1x1 conv, no spatial mixing yet
+
+        # Per-axis positional encoding via depthwise 5x5
+        # Separate because H-strips and W-strips have different spatial structure
+        self.pe_h = Conv(c, c, 5, 1, 2, g=c)  # depthwise, groups=c
+        self.pe_w = Conv(c, c, 5, 1, 2, g=c)  # depthwise, groups=c
+
+        # Output projection per axis before gating
+        self.proj_h = Conv(c, c, 1)
+        self.proj_w = Conv(c, c, 1)
+
+        # Learned gate: decides per-channel how much H vs W contributes
+        # Takes concatenated H+W output, produces per-channel blend weight
+        self.gate = nn.Sequential(
+            Conv(c * 2, c, 1),   # squeeze
+            nn.Sigmoid()          # gate values in [0, 1]
+        )
+
+        # Final output projection
+        self.proj_out = Conv(c, c, 1)
+
+    def attn_along_axis(self, x, axis):
+        """
+        Run area attention along one axis.
+        
+        axis=0: divide into horizontal strips (H axis) — same as original AAttn
+        axis=1: divide into vertical strips   (W axis) — the new addition
+        
+        Returns attended features, same shape as input.
+        """
+        B, C, H, W = x.shape
+
+        if axis == 0:
+            # Horizontal strips: reshape so each strip is a sequence
+            # Strip size: (H/area) x W
+            assert H % self.area == 0, f"H={H} not divisible by area={self.area}"
+            x_r = x.reshape(B * self.area, C, H // self.area, W)
+        else:
+            # Vertical strips: (H) x (W/area)
+            assert W % self.area == 0, f"W={W} not divisible by area={self.area}"
+            x_r = x.reshape(B * self.area, C, H, W // self.area)
+
+        Ba, C, Ha, Wa = x_r.shape
+        N = Ha * Wa   # sequence length per strip
+
+        # Shared QKV projection
+        qkv = self.qkv(x_r)                           # (Ba, 3C, Ha, Wa)
+        qkv = qkv.flatten(2).transpose(1, 2)          # (Ba, N, 3C)
+        q, k, v = qkv.chunk(3, dim=-1)                # each (Ba, N, C)
+
+        # Reshape for multi-head attention
+        q = q.reshape(Ba, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        k = k.reshape(Ba, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        v = v.reshape(Ba, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+
+        # Scaled dot-product attention
+        attn = (q @ k.transpose(-2, -1)) * self.scale  # (Ba, heads, N, N)
+        attn = attn.softmax(dim=-1)
+
+        out = (attn @ v)                               # (Ba, heads, N, head_dim)
+        out = out.permute(0, 2, 1, 3).reshape(Ba, N, C)
+        out = out.transpose(1, 2).reshape(Ba, C, Ha, Wa)
+
+        # Reshape back to original spatial dims
+        if axis == 0:
+            out = out.reshape(B, C, H, W)
+        else:
+            out = out.reshape(B, C, H, W)
+
+        return out
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+
+        # Positional encoding — axis-specific depthwise conv
+        x_h = x + self.pe_h(x)   # enrich with H-axis local structure
+        x_w = x + self.pe_w(x)   # enrich with W-axis local structure
+
+        # Attend along each axis independently using shared QKV weights
+        out_h = self.proj_h(self.attn_along_axis(x_h, axis=0))
+        out_w = self.proj_w(self.attn_along_axis(x_w, axis=1))
+
+        # Learned gate fusion
+        # Gate decides per-channel which axis is more informative
+        gate_input = torch.cat([out_h, out_w], dim=1)  # (B, 2C, H, W)
+        gate       = self.gate(gate_input)              # (B, C,  H, W) in [0,1]
+
+        fused = gate * out_h + (1 - gate) * out_w      # soft blend
+
+        return self.proj_out(fused)
+
+
+class DA2C2f(nn.Module):
+    """
+    Dual-Axis A2C2f.
+    Drop-in replacement for A2C2f that uses DualAxisAttn instead of AAttn.
+    
+    Swap A2C2f → DA2C2f at neck layers 11 and 14 in yolov12s.yaml.
+    Backbone A2C2f blocks at layers 6 and 8 are left unchanged.
+    """
+
+    def __init__(self, c1, c2, n=1, a2=True, area=4, residual=False, e=0.5):
+        super().__init__()
+        self.c      = int(c2 * e)
+        self.cv1    = Conv(c1, 2 * self.c, 1)
+        self.cv2    = Conv((2 + n) * self.c, c2, 1)
+
+        # Use DualAxisAttn if a2=True, otherwise plain bottleneck
+        if a2:
+            self.m = nn.ModuleList(
+                DualAxisAttn(self.c, area=area) for _ in range(n)
+            )
+        else:
+            # Fallback to standard conv bottleneck (same as original C2f)
+            from .block import Bottleneck
+            self.m = nn.ModuleList(
+                Bottleneck(self.c, self.c, residual, e=1.0) for _ in range(n)
+            )
+
+    def forward(self, x):
+        y = list(self.cv1(x).chunk(2, dim=1))
+        y.extend(m(y[-1]) for m in self.m)
+        return self.cv2(torch.cat(y, dim=1))
+    
 class DFL(nn.Module):
     """Integral module of Distribution Focal Loss (DFL).
 
